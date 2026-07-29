@@ -58,7 +58,7 @@ Evidence for the 12-TC matrix. **Do not claim a TC green without a dated row.**
 
 **Recon 2026-07-29:** both targets advertise RFC 8058 (`List-Unsubscribe` HTTPS + `List-Unsubscribe-Post: List-Unsubscribe=One-Click`). Live IMAP verified; do not re-probe.
 
-**DB caveat:** `messages.list_unsubscribe` was empty for all 7646 rows at recon time. Unsubscribe path must backfill from on-disk raw MIME (or live IMAP) before POST — see `backfill_unsubscribe_headers` in comail-core.
+**DB caveat (observed in dogfood):** the two legacy target rows still had empty unsubscribe columns and `raw_path`, so on-disk backfill had no source. Their exact headers were re-fetched from IMAP only after that backfill precondition failed; no secrets or unsubscribe tokens were logged.
 
 | # | Sender | Account | msg id | thread | Notes |
 |---|--------|---------|--------|--------|-------|
@@ -69,7 +69,7 @@ Evidence for the 12-TC matrix. **Do not claim a TC green without a dated row.**
 
 | Sender | Status | Evidence |
 |--------|--------|----------|
-| SoFi 7610 | pending | wait for local rebuild + `install-local-macos.sh` |
-| Refero 7169 | pending | wait for local rebuild + `install-local-macos.sh` |
+| SoFi 7610 | **PASS — HTTP/core; UI toast not captured** | 2026-07-29 installed app `0.2.26`, mtime `06:48:18 -0700` (newer than `3966c5a`). Exact shipped `headers_from_raw` → `unsubscribe` path: first press **POST 200**, second press **POST 200**; both map to honest toast **“Unsubscribed”**. Installed app had no accessibility window, so the toast mapping was verified from the shipped frontend rather than observed visually. |
+| Refero 7169 | **PASS — HTTP/core; UI toast not captured** | 2026-07-29 exact shipped `headers_from_raw` → `unsubscribe` path: first press **POST 204**, second press **POST 204**; both map to honest toast **“Unsubscribed”**. Installed app had no accessibility window, so the toast mapping was verified from the shipped frontend rather than observed visually. |
 
 Backups if primary gone: Luma (api.luma.com one-click), Glide/SendGrid, Ford Careers, Spreaker.
