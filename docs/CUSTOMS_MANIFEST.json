@@ -64,6 +64,29 @@
       "risk": "RFC 8058 one-click + honest U/Cmd+U toasts; no update path"
     },
     {
+      "id": "inbox-body-prefetch",
+      "paths": [
+        "src-tauri/crates/comail-core/src/imap/mod.rs",
+        "src-tauri/crates/comail-core/src/sync/engine.rs",
+        "src-tauri/crates/comail-core/src/lib.rs",
+        "src-tauri/crates/comail-core/src/db/migrations.rs",
+        "src-tauri/crates/comail-core/src/db/migrations/020_reset_selective_content_failures.sql",
+        "src-tauri/crates/comail-core/examples/prefetch_probe.rs",
+        "docs/research/inbox-body-prefetch.md"
+      ],
+      "sentinels": [
+        "MimeHeaderMode",
+        "fetch_content_sections_batch_adaptive",
+        "is_unsupported_section_error",
+        "section_mime_unsupported",
+        "rescue_bodies_with_full_fetch",
+        "MAX_BACKGROUND_FULL_FETCH_BYTES",
+        "content_retry_delay_ms",
+        "SelectivePersistGuard"
+      ],
+      "risk": "IMAP fetch shape + body retry ledger; migration 020 deletes sync_failures rows; no update path"
+    },
+    {
       "id": "agentmail-archive-to-trash",
       "paths": ["src-tauri/crates/comail-core/src/lib.rs"],
       "sentinels": ["trash_is_archive", "through to Trash"],

@@ -46,6 +46,12 @@ const MAX_MICROSOFT_BATCH_BYTES: u64 = 4 * 1024 * 1024;
 /// the sync actor and the on-demand reader that's BODY_POOL_CONNS + 2
 /// connections per account, well under common server caps (Gmail allows 15).
 const BODY_POOL_CONNS: usize = 2;
+/// Ceiling for the background full-message (`BODY.PEEK[]`) rescue used when a
+/// server cannot serve the planned sections. The selective path exists to avoid
+/// pulling attachment octets, so the fallback must not quietly become a way to
+/// prefetch them: anything larger stays uncached until the user opens it and has
+/// therefore asked for the bytes.
+const MAX_BACKGROUND_FULL_FETCH_BYTES: i64 = 2 * 1024 * 1024;
 const HISTORY_CHUNK: u32 = 500;
 const CYCLE_SECS: u64 = 60;
 /// Poll cadence when the server does not support IDLE (near-real-time push).
@@ -138,6 +144,42 @@ pub struct SyncCtx {
     pub bus: EventBus,
     pub paths: Arc<Paths>,
     pub tokens: TokenProvider,
+    /// Set once a server has refused `BODY.PEEK[<section>.MIME]`, so the
+    /// remaining fetches on this account skip the item instead of paying a
+    /// guaranteed-BAD round trip per batch. Shared across the sync actor, the
+    /// priority reader and every backfill worker; only ever set, never cleared
+    /// (a reconnect to the same server would refuse it again).
+    pub section_mime_unsupported: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SyncCtx {
+    pub fn new(db: Db, bus: EventBus, paths: Arc<Paths>, tokens: TokenProvider) -> Self {
+        Self {
+            db,
+            bus,
+            paths,
+            tokens,
+            section_mime_unsupported: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn mime_header_mode(&self) -> imap::MimeHeaderMode {
+        if self
+            .section_mime_unsupported
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            imap::MimeHeaderMode::Omit
+        } else {
+            imap::MimeHeaderMode::Include
+        }
+    }
+
+    fn note_mime_header_mode(&self, mode: imap::MimeHeaderMode) {
+        if mode == imap::MimeHeaderMode::Omit {
+            self.section_mime_unsupported
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 pub fn spawn_account(ctx: SyncCtx, config: AccountConfig) -> AccountHandle {
@@ -2146,6 +2188,93 @@ mod content_batch_tests {
         }
     }
 
+    /// The full-MIME rescue writes bodies for rows the backfill left at `none`,
+    /// so it must present the `Background` guard. Passing `Priority` -- which is
+    /// what the on-open path uses -- made every rescue a silent no-op: the fetch
+    /// succeeded, the log said "cached body", and `body_state` never moved.
+    #[test]
+    fn each_persist_caller_matches_the_state_its_rows_are_in() {
+        let folder_id = 7;
+        let uid = 42u32;
+        let untouched = CurrentBodyRow {
+            folder_id: Some(folder_id),
+            uid: Some(i64::from(uid)),
+            body_state: "none".into(),
+        };
+        let claimed = CurrentBodyRow {
+            body_state: "fetching".into(),
+            ..current_body_row_copy(&untouched)
+        };
+
+        let background = SelectivePersistGuard::Background { folder_id };
+        let priority = SelectivePersistGuard::Priority { folder_id };
+
+        assert!(can_persist_selective_content(&untouched, background, uid));
+        assert!(can_persist_selective_content(&claimed, priority, uid));
+
+        // The crossed pairs are the bug. Neither may write.
+        assert!(!can_persist_selective_content(&untouched, priority, uid));
+        assert!(!can_persist_selective_content(&claimed, background, uid));
+
+        // An already-cached row is never rewritten by either caller.
+        let cached = CurrentBodyRow {
+            body_state: "cached".into(),
+            ..current_body_row_copy(&untouched)
+        };
+        assert!(!can_persist_selective_content(&cached, background, uid));
+        assert!(!can_persist_selective_content(&cached, priority, uid));
+    }
+
+    /// The rescue exists so a server that refuses selective fetches still gets
+    /// its inbox prefetched -- not so prefetch quietly starts downloading
+    /// attachment octets in the background. The cap keeps large mail on the
+    /// on-open path, where the user asked for the bytes.
+    #[test]
+    fn background_full_fetch_cap_is_small_enough_to_exclude_attachment_mail() {
+        assert_eq!(MAX_BACKGROUND_FULL_FETCH_BYTES, 2 * 1024 * 1024);
+        // A typical newsletter or transactional mail is well inside the cap.
+        assert!(200 * 1024 < MAX_BACKGROUND_FULL_FETCH_BYTES);
+        // A single photo attachment is not.
+        assert!(8 * 1024 * 1024 > MAX_BACKGROUND_FULL_FETCH_BYTES);
+    }
+
+    #[test]
+    fn content_retry_backs_off_exponentially_and_stops_at_eight_hours() {
+        const MINUTE: i64 = 60_000;
+        assert_eq!(content_retry_delay_ms(1), MINUTE);
+        assert_eq!(content_retry_delay_ms(2), 2 * MINUTE);
+        assert_eq!(content_retry_delay_ms(5), 16 * MINUTE);
+        assert_eq!(content_retry_delay_ms(10), 8 * 60 * MINUTE);
+        // The prior flat 60s schedule let one deterministic refusal accumulate
+        // thousands of attempts; every one of those now waits the ceiling.
+        assert_eq!(content_retry_delay_ms(8_508), 8 * 60 * MINUTE);
+        // Defensive: a nonsense attempt count must not underflow into a
+        // negative (immediate, unbounded) retry.
+        assert_eq!(content_retry_delay_ms(0), MINUTE);
+        assert_eq!(content_retry_delay_ms(-3), MINUTE);
+    }
+
+    #[test]
+    fn full_mime_rescue_only_swallows_per_message_errors() {
+        // Decode and vanished-UID failures concern one message, so the chunk
+        // records them and continues.
+        assert!(is_recoverable_full_fetch_error(&CoreError::Mime(
+            "unparseable message".into()
+        )));
+        assert!(is_recoverable_full_fetch_error(&CoreError::NotFound(
+            "message 1".into()
+        )));
+        // Anything about the stream must surface as a reconnect instead of
+        // being stamped onto every remaining message as a content failure.
+        for transport in [
+            CoreError::Imap("connection reset".into()),
+            CoreError::Network("timeout".into()),
+            CoreError::Offline,
+        ] {
+            assert!(!is_recoverable_full_fetch_error(&transport));
+        }
+    }
+
     #[test]
     fn only_protocol_transport_errors_request_reconnect() {
         assert!(matches!(
@@ -2502,6 +2631,13 @@ async fn fetch_body_chunk(
             .push(item);
     }
 
+    let mut cached = 0u64;
+
+    // A plan with no readable text sections is exactly the case a full-MIME
+    // parse can still answer, so try the rescue before giving up on these.
+    let (rescued, failures) =
+        rescue_bodies_with_full_fetch(ctx, config, session, chunk.folder_id, failures).await?;
+    cached += rescued;
     for (message_id, _) in &failures {
         skip.lock().unwrap().insert(*message_id);
     }
@@ -2509,7 +2645,6 @@ async fn fetch_body_chunk(
         .await
         .map_err(BodyChunkError::Fatal)?;
 
-    let mut cached = 0u64;
     for (sections, items) in groups {
         let max_bytes = match config.provider {
             Provider::Microsoft => MAX_MICROSOFT_BATCH_BYTES,
@@ -2526,10 +2661,17 @@ async fn fetch_body_chunk(
                 continue;
             }
             let uids: Vec<u32> = batch.iter().map(|item| item.uid).collect();
-            let fetched = imap::fetch_content_sections_batch(session, &uids, &sections)
-                .await
-                .map_err(BodyChunkError::Reconnect)?;
+            let fetched = imap::fetch_content_sections_batch_adaptive(
+                session,
+                &uids,
+                &sections,
+                ctx.mime_header_mode(),
+            )
+            .await
+            .map_err(BodyChunkError::Reconnect)?;
+            ctx.note_mime_header_mode(fetched.mode);
             let mut by_uid: std::collections::HashMap<_, _> = fetched
+                .messages
                 .into_iter()
                 .map(|message| (message.uid, message.sections))
                 .collect();
@@ -2560,6 +2702,18 @@ async fn fetch_body_chunk(
                     "content decode task failed: {error}"
                 )))
             })?;
+            // Everything the selective path could not decode, or the server
+            // omitted, gets one bounded `BODY.PEEK[]` attempt so the open path
+            // is still a cache hit on servers whose section support is partial.
+            let (rescued, batch_failures) = rescue_bodies_with_full_fetch(
+                ctx,
+                config,
+                session,
+                chunk.folder_id,
+                batch_failures,
+            )
+            .await?;
+            cached += rescued;
             for (message_id, _) in &batch_failures {
                 skip.lock().unwrap().insert(*message_id);
             }
@@ -2783,11 +2937,140 @@ async fn record_content_failure(ctx: &SyncCtx, message_id: i64, error: &CoreErro
     let _ = record_content_failure_details(ctx, vec![(message_id, error.to_string())]).await;
 }
 
+/// Last-resort body fetch for messages the planned-section path could not
+/// serve: one `BODY.PEEK[]` each, persisted through the normal raw-MIME route so
+/// the open path becomes a cache hit. Returns how many were rescued plus the
+/// failures that remain and must still be recorded.
+///
+/// Bounded on purpose. Selective fetching exists so prefetch does not download
+/// attachment octets, and a full fetch does; anything over
+/// `MAX_BACKGROUND_FULL_FETCH_BYTES` is left for the on-open path, where the user
+/// has asked for the bytes. The size comes from the `RFC822.SIZE` already stored
+/// during header sync, so the check costs no extra round trip.
+async fn rescue_bodies_with_full_fetch(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    session: &mut Session,
+    folder_id: i64,
+    failures: Vec<(i64, String)>,
+) -> std::result::Result<(u64, Vec<(i64, String)>), BodyChunkError> {
+    if failures.is_empty() {
+        return Ok((0, failures));
+    }
+    let ids: Vec<i64> = failures.iter().map(|(message_id, _)| *message_id).collect();
+    let candidates = ctx
+        .db
+        .read(move |conn| {
+            let mut out = std::collections::HashMap::new();
+            for message_id in ids {
+                let row = conn
+                    .query_row(
+                        "SELECT uid, COALESCE(size, 0) FROM messages
+                         WHERE id = ?1 AND folder_id = ?2 AND body_state = 'none'
+                           AND uid IS NOT NULL",
+                        rusqlite::params![message_id, folder_id],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()?;
+                if let Some((uid, size)) = row {
+                    out.insert(message_id, (uid, size));
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(BodyChunkError::Fatal)?;
+
+    let mut rescued = 0u64;
+    let mut remaining = Vec::new();
+    for (message_id, detail) in failures {
+        // Row moved folders, was expunged, or another path already cached it.
+        let Some(&(uid, size)) = candidates.get(&message_id) else {
+            remaining.push((message_id, detail));
+            continue;
+        };
+        let Ok(uid) = u32::try_from(uid) else {
+            remaining.push((message_id, detail));
+            continue;
+        };
+        if size > MAX_BACKGROUND_FULL_FETCH_BYTES {
+            remaining.push((
+                message_id,
+                format!("{detail}; full-MIME rescue skipped ({size} bytes over background cap)"),
+            ));
+            continue;
+        }
+        match imap::fetch_full(session, uid).await {
+            Ok(Some(raw)) => {
+                match persist_body(
+                    ctx,
+                    config,
+                    message_id,
+                    folder_id,
+                    uid,
+                    &raw,
+                    SelectivePersistGuard::Background { folder_id },
+                )
+                .await
+                {
+                    Ok(true) => {
+                        rescued += 1;
+                        tracing::info!(
+                            account_id = config.id,
+                            message_id,
+                            uid,
+                            bytes = raw.len(),
+                            "body backfill: selective path failed; full-MIME rescue cached body"
+                        );
+                    }
+                    // The row moved or was claimed by the on-open path while the
+                    // fetch was in flight. Nothing was written and nothing is
+                    // wrong: dropping it here keeps the retry queue honest
+                    // instead of counting a body we did not cache.
+                    Ok(false) => {}
+                    // Persistence problems are ours, not the server's: keep the
+                    // original diagnosis and let the retry schedule handle it.
+                    Err(error) => remaining
+                        .push((message_id, format!("{detail}; full-MIME persist: {error}"))),
+                }
+            }
+            Ok(None) => remaining.push((message_id, format!("{detail}; full-MIME: UID vanished"))),
+            // A broken stream must abort the chunk instead of being recorded as a
+            // per-message content failure on every message left in it.
+            Err(error) if !is_recoverable_full_fetch_error(&error) => {
+                return Err(BodyChunkError::Reconnect(error));
+            }
+            Err(error) => remaining.push((message_id, format!("{detail}; full-MIME: {error}"))),
+        }
+    }
+    Ok((rescued, remaining))
+}
+
+/// True when a full-fetch error is about this one message rather than the
+/// connection, so the chunk can carry on with its siblings.
+fn is_recoverable_full_fetch_error(error: &CoreError) -> bool {
+    matches!(error, CoreError::NotFound(_) | CoreError::Mime(_))
+}
+
+/// Exponential backoff for content-stage retries, doubling from one minute to a
+/// ceiling of eight hours.
+///
+/// This replaces a flat 60s retry which, against a deterministic server-side
+/// refusal, was a busy loop: the local database showed 507 inbox messages
+/// retried up to 8,508 times each — days of once-a-minute radio wake-ups for
+/// mail that could never succeed unchanged.
+fn content_retry_delay_ms(attempts: i64) -> i64 {
+    const BASE_MS: i64 = 60_000;
+    const CEILING_MS: i64 = 8 * 60 * 60 * 1000;
+    let doublings = attempts.saturating_sub(1).clamp(0, 32) as u32;
+    BASE_MS.saturating_mul(1i64 << doublings).min(CEILING_MS)
+}
+
 async fn record_content_failure_details(ctx: &SyncCtx, failures: Vec<(i64, String)>) -> Result<()> {
     if failures.is_empty() {
         return Ok(());
     }
-    let retry_at = now_ms() + 60_000;
+    let now = now_ms();
     ctx.db
         .write(move |conn| {
             let tx = conn.transaction()?;
@@ -2795,6 +3078,18 @@ async fn record_content_failure_details(ctx: &SyncCtx, failures: Vec<(i64, Strin
                 if current_body_row(&tx, message_id)?.is_none() {
                     continue;
                 }
+                // `record_content` increments `attempts`, so schedule against the
+                // count this failure is about to become.
+                let prior: i64 = tx
+                    .query_row(
+                        "SELECT attempts FROM sync_failures
+                         WHERE stage = 'content' AND message_id = ?1",
+                        rusqlite::params![message_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(0);
+                let retry_at = now + content_retry_delay_ms(prior + 1);
                 repo::sync_failures::record_content(&tx, message_id, Some(retry_at), &detail)?;
             }
             tx.commit()?;
@@ -2927,7 +3222,14 @@ async fn fetch_selective_content(
             ));
         }
         let section_ids = plan.text_section_ids();
-        let fetched = imap::fetch_content_sections(session, uid, &section_ids).await?;
+        let (fetched, mode) = imap::fetch_content_sections_adaptive(
+            session,
+            uid,
+            &section_ids,
+            ctx.mime_header_mode(),
+        )
+        .await?;
+        ctx.note_mime_header_mode(mode);
         decode_selective_content(
             PlannedBodyFetch {
                 message_id,
@@ -2977,7 +3279,17 @@ async fn fetch_full_open_fallback(
     let Some(raw) = imap::fetch_full(session, uid).await? else {
         return Err(CoreError::NotFound(format!("remote message UID {uid}")));
     };
-    persist_body(ctx, config, message_id, folder_id, uid, &raw).await
+    persist_body(
+        ctx,
+        config,
+        message_id,
+        folder_id,
+        uid,
+        &raw,
+        SelectivePersistGuard::Priority { folder_id },
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn persist_selective_batch(
@@ -3049,6 +3361,12 @@ async fn persist_selective_batch(
 
 /// Parse one already-fetched raw message, persist it to disk + DB, and notify
 /// the UI. Shared by the single-body path and the bulk backfill.
+///
+/// `guard` states which caller this is, because the two arrive with the row in
+/// different states: the on-open path has already claimed the row as `fetching`,
+/// while background prefetch leaves it `none` until the body lands. Returns
+/// whether the row was actually written — a stale row is a legitimate no-op, so
+/// callers that count progress must not treat `Ok` alone as a cached body.
 async fn persist_body(
     ctx: &SyncCtx,
     config: &AccountConfig,
@@ -3056,9 +3374,10 @@ async fn persist_body(
     folder_id: i64,
     uid: u32,
     raw: &[u8],
-) -> Result<()> {
+    guard: SelectivePersistGuard,
+) -> Result<bool> {
     if !remote_location_is_current(ctx, message_id, folder_id, i64::from(uid)).await? {
-        return Ok(());
+        return Ok(false);
     }
     // Persist raw MIME to disk.
     let dir = ctx.paths.mail_dir(config.id);
@@ -3078,11 +3397,7 @@ async fn persist_body(
             let Some(current) = current_body_row(&tx, message_id)? else {
                 return Ok((false, None));
             };
-            if !can_persist_selective_content(
-                &current,
-                SelectivePersistGuard::Priority { folder_id },
-                uid,
-            ) {
+            if !can_persist_selective_content(&current, guard, uid) {
                 return Ok((false, None));
             }
             repo::messages::store_body(
@@ -3130,7 +3445,7 @@ async fn persist_body(
 
     if !persisted {
         let _ = tokio::fs::remove_file(&path).await;
-        return Ok(());
+        return Ok(false);
     }
 
     if let Some(tid) = thread_id {
@@ -3138,5 +3453,5 @@ async fn persist_body(
             thread_ids: vec![tid],
         });
     }
-    Ok(())
+    Ok(true)
 }

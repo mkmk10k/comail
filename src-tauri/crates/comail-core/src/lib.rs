@@ -350,12 +350,12 @@ impl Core {
     }
 
     fn sync_ctx(&self) -> SyncCtx {
-        SyncCtx {
-            db: self.db.clone(),
-            bus: self.bus.clone(),
-            paths: self.paths.clone(),
-            tokens: self.tokens.clone(),
-        }
+        SyncCtx::new(
+            self.db.clone(),
+            self.bus.clone(),
+            self.paths.clone(),
+            self.tokens.clone(),
+        )
     }
 
     async fn spawn_actor(&self, cfg: AccountConfig) {
