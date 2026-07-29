@@ -453,20 +453,59 @@ fn section_paths(sections: &[String]) -> Result<Vec<(String, Vec<u32>)>> {
         .collect()
 }
 
-fn section_fetch_query(paths: &[(String, Vec<u32>)]) -> String {
+/// Whether a selective fetch also asks for each section's `.MIME` header.
+///
+/// The `.MIME` item is only ever a cross-check: `decode_planned_text_section`
+/// ORs `header_declares_base64(mime_header)` against the transfer encoding the
+/// v2 plan already carries from BODYSTRUCTURE. Some servers (`imap.agentmail.to`
+/// among them) answer `BAD ... unsupported BODY section: 1.MIME` and, because
+/// one bad item fails the whole command, that single extra item is enough to
+/// make every body fetch on the account fail. So it is requested optimistically
+/// and dropped for the rest of the connection the first time a server refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MimeHeaderMode {
+    /// Ask for `BODY.PEEK[<section>.MIME]` alongside each section body.
+    Include,
+    /// Ask for section bodies only; the plan supplies the encoding metadata.
+    Omit,
+}
+
+impl MimeHeaderMode {
+    fn includes_headers(self) -> bool {
+        matches!(self, MimeHeaderMode::Include)
+    }
+}
+
+fn section_fetch_query(paths: &[(String, Vec<u32>)], mode: MimeHeaderMode) -> String {
     format!(
         "(UID {})",
         paths
             .iter()
             .flat_map(|(section, _)| {
-                [
-                    format!("BODY.PEEK[{section}.MIME]"),
-                    format!("BODY.PEEK[{section}]"),
-                ]
+                let body = format!("BODY.PEEK[{section}]");
+                match mode {
+                    MimeHeaderMode::Include => {
+                        vec![format!("BODY.PEEK[{section}.MIME]"), body]
+                    }
+                    MimeHeaderMode::Omit => vec![body],
+                }
             })
             .collect::<Vec<_>>()
             .join(" ")
     )
+}
+
+/// True when a FETCH failed because the server rejects a `BODY[...]` section
+/// item rather than because the connection or mailbox is unhealthy. Retrying
+/// such a command unchanged can only fail again; retrying it without `.MIME`
+/// is what actually recovers.
+pub fn is_unsupported_section_error(error: &CoreError) -> bool {
+    let CoreError::Imap(message) = error else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    message.contains("unsupported body section")
+        || (message.contains("bad") && message.contains(".mime"))
 }
 
 fn normalized_uid_set(uids: &[u32]) -> Result<String> {
@@ -483,6 +522,7 @@ async fn fetch_sections_batch_inner(
     session: &mut Session,
     uids: &[u32],
     sections: &[String],
+    mode: MimeHeaderMode,
 ) -> Result<Vec<FetchedMessageSections>> {
     use async_imap::imap_proto::{MessageSection, SectionPath};
 
@@ -494,7 +534,7 @@ async fn fetch_sections_batch_inner(
     if paths.is_empty() || uid_set.is_empty() {
         return Ok(Vec::new());
     }
-    let query = section_fetch_query(&paths);
+    let query = section_fetch_query(&paths, mode);
     let requested: std::collections::HashSet<u32> = uids.iter().copied().collect();
 
     let mut result = std::collections::BTreeMap::<u32, Vec<FetchedSection>>::new();
@@ -519,10 +559,14 @@ async fn fetch_sections_batch_inner(
                 }
                 fetched.push(FetchedSection {
                     section: section.clone(),
-                    mime_header: fetch
-                        .section(&mime_path)
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_default(),
+                    mime_header: if mode.includes_headers() {
+                        fetch
+                            .section(&mime_path)
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
                     body: body.to_vec(),
                 });
             }
@@ -540,13 +584,52 @@ pub async fn fetch_content_sections_batch(
     session: &mut Session,
     uids: &[u32],
     sections: &[String],
+    mode: MimeHeaderMode,
 ) -> Result<Vec<FetchedMessageSections>> {
     with_deadline(
         "UID FETCH content sections batch",
         CONTENT_TIMEOUT,
-        fetch_sections_batch_inner(session, uids, sections),
+        fetch_sections_batch_inner(session, uids, sections, mode),
     )
     .await
+}
+
+/// Outcome of an adaptive selective fetch: the sections plus the mode that
+/// actually worked, so the caller can remember a server's refusal instead of
+/// paying the failed round trip on every subsequent batch.
+pub struct AdaptiveSections {
+    pub messages: Vec<FetchedMessageSections>,
+    pub mode: MimeHeaderMode,
+}
+
+/// Fetch planned sections, degrading once from `Include` to `Omit` if the
+/// server rejects the `.MIME` items. `preferred` should be whatever mode last
+/// succeeded on this connection.
+pub async fn fetch_content_sections_batch_adaptive(
+    session: &mut Session,
+    uids: &[u32],
+    sections: &[String],
+    preferred: MimeHeaderMode,
+) -> Result<AdaptiveSections> {
+    match fetch_content_sections_batch(session, uids, sections, preferred).await {
+        Ok(messages) => Ok(AdaptiveSections {
+            messages,
+            mode: preferred,
+        }),
+        Err(error) if preferred.includes_headers() && is_unsupported_section_error(&error) => {
+            tracing::info!(
+                error = %error,
+                "server rejects BODY.PEEK[<section>.MIME]; retrying without MIME headers"
+            );
+            let messages =
+                fetch_content_sections_batch(session, uids, sections, MimeHeaderMode::Omit).await?;
+            Ok(AdaptiveSections {
+                messages,
+                mode: MimeHeaderMode::Omit,
+            })
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Fetch only the planned readable MIME sections for one message. Callers
@@ -556,12 +639,33 @@ pub async fn fetch_content_sections(
     session: &mut Session,
     uid: u32,
     sections: &[String],
+    mode: MimeHeaderMode,
 ) -> Result<Vec<FetchedSection>> {
-    let mut messages = fetch_content_sections_batch(session, &[uid], sections).await?;
+    let mut messages = fetch_content_sections_batch(session, &[uid], sections, mode).await?;
     Ok(messages
         .pop()
         .map(|message| message.sections)
         .unwrap_or_default())
+}
+
+/// Single-message counterpart to `fetch_content_sections_batch_adaptive`.
+pub async fn fetch_content_sections_adaptive(
+    session: &mut Session,
+    uid: u32,
+    sections: &[String],
+    preferred: MimeHeaderMode,
+) -> Result<(Vec<FetchedSection>, MimeHeaderMode)> {
+    let mut fetched =
+        fetch_content_sections_batch_adaptive(session, &[uid], sections, preferred).await?;
+    let mode = fetched.mode;
+    Ok((
+        fetched
+            .messages
+            .pop()
+            .map(|message| message.sections)
+            .unwrap_or_default(),
+        mode,
+    ))
 }
 
 /// Fetch one attachment/inline section on demand. The section is validated as
@@ -572,10 +676,13 @@ pub async fn fetch_attachment_section(
     section: &str,
 ) -> Result<Option<FetchedSection>> {
     let sections = [section.to_owned()];
+    // Attachments keep asking for `.MIME`: unlike planned text sections there
+    // is no persisted plan to supply the transfer encoding, so
+    // `decode_attachment_section` needs the real part header.
     let mut messages = with_deadline(
         "UID FETCH attachment section",
         ATTACHMENT_TIMEOUT,
-        fetch_sections_batch_inner(session, &[uid], &sections),
+        fetch_sections_batch_inner(session, &[uid], &sections, MimeHeaderMode::Include),
     )
     .await?;
     Ok(messages
@@ -937,7 +1044,9 @@ pub fn uid_set(uids: &[u32]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MIME_PLAN_QUERY, normalized_uid_set, section_fetch_query, section_paths};
+    use super::{
+        MIME_PLAN_QUERY, MimeHeaderMode, normalized_uid_set, section_fetch_query, section_paths,
+    };
 
     #[test]
     fn uid_set_compresses() {
@@ -959,7 +1068,7 @@ mod tests {
         let sections = vec!["1".to_string(), "2.3".to_string()];
         let paths = section_paths(&sections).unwrap();
         assert_eq!(
-            section_fetch_query(&paths),
+            section_fetch_query(&paths, MimeHeaderMode::Include),
             "(UID BODY.PEEK[1.MIME] BODY.PEEK[1] BODY.PEEK[2.3.MIME] BODY.PEEK[2.3])"
         );
 
@@ -969,6 +1078,57 @@ mod tests {
                 "accepted invalid section {invalid:?}"
             );
         }
+    }
+
+    /// `imap.agentmail.to` answers `BAD ... unsupported BODY section: 1.MIME`,
+    /// and one rejected item fails the whole FETCH. Omit mode must drop the
+    /// `.MIME` items entirely while keeping every section body.
+    #[test]
+    fn omit_mode_drops_mime_items_but_keeps_section_bodies() {
+        let sections = vec!["1".to_string(), "2.3".to_string()];
+        let paths = section_paths(&sections).unwrap();
+        let query = section_fetch_query(&paths, MimeHeaderMode::Omit);
+        assert_eq!(query, "(UID BODY.PEEK[1] BODY.PEEK[2.3])");
+        assert!(!query.contains(".MIME"));
+    }
+
+    /// Prefetch must never set `\Seen`, so every emitted body item is PEEK.
+    #[test]
+    fn every_section_query_uses_peek_only() {
+        let paths = section_paths(&["1".to_string(), "2".to_string()]).unwrap();
+        for mode in [MimeHeaderMode::Include, MimeHeaderMode::Omit] {
+            let query = section_fetch_query(&paths, mode);
+            // Strip the PEEK spelling; nothing resembling a non-peek fetch of a
+            // body section may survive.
+            let residue = query.replace("BODY.PEEK[", "");
+            assert!(
+                !residue.contains("BODY["),
+                "non-PEEK body fetch in {mode:?} query: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_section_errors_are_distinguished_from_transport_errors() {
+        use super::is_unsupported_section_error;
+        use crate::error::CoreError;
+
+        // Verbatim shape observed from imap.agentmail.to.
+        assert!(is_unsupported_section_error(&CoreError::Imap(
+            "UID command error: BAD [\"FETCH: unsupported BODY section: 1.MIME in BODY.PEEK[1.MIME]\"]"
+                .into()
+        )));
+        // A dropped connection or timeout must NOT be treated as a capability
+        // signal: degrading on it would silently discard `.MIME` forever.
+        assert!(!is_unsupported_section_error(&CoreError::Imap(
+            "connection reset by peer".into()
+        )));
+        assert!(!is_unsupported_section_error(&CoreError::Imap(
+            "UID FETCH content sections batch timed out".into()
+        )));
+        assert!(!is_unsupported_section_error(&CoreError::Other(
+            "unsupported BODY section".into()
+        )));
     }
 
     #[test]
