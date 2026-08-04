@@ -15,7 +15,10 @@
         "src/stores/ui.ts",
         "src/components/inbox/ThreadList.tsx"
       ],
-      "sentinels": ["hoveredThreadId", "Pointer over a row beats"],
+      "sentinels": [
+        "hoveredThreadId",
+        "Pointer over a row beats"
+      ],
       "risk": "keyboard targeting; no update path"
     },
     {
@@ -65,20 +68,34 @@
     },
     {
       "id": "agentmail-archive-to-trash",
-      "paths": ["src-tauri/crates/comail-core/src/lib.rs"],
-      "sentinels": ["trash_is_archive", "through to Trash"],
+      "paths": [
+        "src-tauri/crates/comail-core/src/lib.rs"
+      ],
+      "sentinels": [
+        "trash_is_archive",
+        "through to Trash"
+      ],
       "risk": "core folder fallback; no update path"
     },
     {
       "id": "update-channel-lock",
-      "paths": ["src/lib/updateChannel.ts", "src/ipc/updater.ts"],
-      "sentinels": ["UPDATE_CHANNEL", "TC-UPD-00"],
-      "risk": "touches update path — must stay locked until P2 cutover"
+      "paths": [
+        "src/lib/updateChannel.ts",
+        "src/ipc/updater.ts"
+      ],
+      "sentinels": [
+        "UPDATE_CHANNEL",
+        "TC-UPD-00"
+      ],
+      "risk": "touches update path \u2014 must stay locked until P2 cutover"
     },
     {
       "id": "facetime-whatsapp-presets",
       "paths": [],
-      "sentinels": ["FaceTime", "WhatsApp"],
+      "sentinels": [
+        "FaceTime",
+        "WhatsApp"
+      ],
       "notes": "Already on master via merged PRs; verify Join/presets on L3 dogfood",
       "risk": "calendar UI; no update path"
     },
@@ -94,6 +111,28 @@
         "smtp send: local attachment chips"
       ],
       "risk": "send path; Sent UI chips without waiting on IMAP BODYSTRUCTURE"
+    },
+    {
+      "id": "memory-caps",
+      "paths": [
+        "src-tauri/crates/comail-core/src/sync/engine.rs",
+        "src-tauri/crates/comail-core/src/imap/mod.rs",
+        "src-tauri/crates/comail-core/src/mime/mod.rs",
+        "src-tauri/crates/comail-core/src/db/mod.rs",
+        "src-tauri/crates/comail-core/src/db/repo/messages.rs",
+        "src-tauri/crates/comail-core/src/lib.rs",
+        "src/queries/client.ts",
+        "src/queries/hooks.ts",
+        "src/components/inbox/ThreadList.tsx"
+      ],
+      "sentinels": [
+        "GLOBAL_BODY_BACKFILL_SLOTS",
+        "recovery_attempted",
+        "MimeHeaderMode",
+        "body_backfill_slots",
+        "NO_PROGRESS_BACKOFF_SECS"
+      ],
+      "risk": "sync + SQLite pragmas + React Query retention; no update path"
     }
   ],
   "dirty_allowlist": [

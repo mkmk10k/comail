@@ -131,12 +131,14 @@ export function ThreadList({
   const handleToggleCheck = useCallback((id: number) => toggleSelect(id), [toggleSelect]);
 
   // Hover intent: track the row under the pointer (keyboard triage prefers it)
-  // and after 80ms warm the thread cache so a click paints from cache.
+  // and after a short dwell warm the thread cache. Debounce is deliberately
+  // longer than a fast scroll-through so we do not IPC-fetch full HTML for
+  // every row the pointer crosses.
   const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handleRowHover = useCallback((id: number | null) => {
     useUi.getState().set({ hoveredThreadId: id });
     if (hoverTimer.current) clearTimeout(hoverTimer.current);
-    hoverTimer.current = id == null ? null : setTimeout(() => prefetchThread(id), 80);
+    hoverTimer.current = id == null ? null : setTimeout(() => prefetchThread(id), 350);
   }, []);
   useEffect(
     () => () => {

@@ -308,11 +308,17 @@ pub fn store_body(
 /// their MIME transfer encoding. These rows are otherwise permanently stuck
 /// at `cached`, so merely fixing the decoder would never revisit them.
 ///
+/// Cap how many misdecoded bodies one launch may requeue. Unbounded recovery
+/// once deleted hundreds of cached bodies and kicked every account's backfill
+/// pool into a multi-GB RAM spike.
+const MISDECODE_REQUEUE_CAP: usize = 100;
+
 /// The recovery is deliberately conservative: it only considers remotely
 /// refetchable rows with no full-message raw cache, and requires either a
 /// Base64 payload that decodes to HTML or many quoted-printable artifacts.
+/// Each plan is only requeued once (`MimePlan::recovery_attempted`).
 pub fn requeue_misdecoded_bodies(conn: &mut Connection) -> Result<Vec<i64>> {
-    let ids = {
+    let candidates = {
         let mut stmt = conn.prepare(
             "SELECT m.id, b.text_body, b.html_body, m.mime_plan_json
              FROM messages m
@@ -327,7 +333,8 @@ pub fn requeue_misdecoded_bodies(conn: &mut Connection) -> Result<Vec<i64>> {
                AND (
                  LOWER(COALESCE(m.mime_plan_json, '')) LIKE '%\"transfer_encoding\":\"base64\"%'
                  OR LOWER(COALESCE(m.mime_plan_json, '')) LIKE '%\"transfer_encoding\":\"quoted-printable\"%'
-               )",
+               )
+             ORDER BY m.date DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -343,6 +350,9 @@ pub fn requeue_misdecoded_bodies(conn: &mut Connection) -> Result<Vec<i64>> {
             let plan = plan_json
                 .as_deref()
                 .and_then(|value| serde_json::from_str::<MimePlan>(value).ok());
+            if plan.as_ref().is_some_and(|plan| plan.recovery_attempted) {
+                continue;
+            }
             let has_any_base64 = plan.as_ref().is_some_and(|plan| {
                 plan.text_sections
                     .iter()
@@ -391,19 +401,23 @@ pub fn requeue_misdecoded_bodies(conn: &mut Connection) -> Result<Vec<i64>> {
                         .as_deref()
                         .is_some_and(crate::mime::looks_like_undecoded_quoted_printable));
             if legacy_base64 || bad_base64 || bad_quoted_printable {
-                ids.push(id);
+                ids.push((id, plan));
+                if ids.len() >= MISDECODE_REQUEUE_CAP {
+                    break;
+                }
             }
         }
         ids
     };
 
-    if ids.is_empty() {
-        return Ok(ids);
+    if candidates.is_empty() {
+        return Ok(Vec::new());
     }
 
     let tx = conn.transaction()?;
     let mut thread_ids = std::collections::BTreeSet::new();
-    for &id in &ids {
+    let mut ids = Vec::with_capacity(candidates.len());
+    for (id, plan) in candidates {
         if let Some(thread_id) = tx.query_row(
             "SELECT thread_id FROM messages WHERE id = ?1",
             params![id],
@@ -411,6 +425,15 @@ pub fn requeue_misdecoded_bodies(conn: &mut Connection) -> Result<Vec<i64>> {
         )? {
             thread_ids.insert(thread_id);
         }
+        // Persist the once-only marker on the plan before clearing the body so
+        // a false-positive never requeues the same message after refetch.
+        let mut marked = plan.unwrap_or_default();
+        marked.recovery_attempted = true;
+        let plan_json = serde_json::to_string(&marked).unwrap_or_else(|_| "{}".into());
+        tx.execute(
+            "UPDATE messages SET mime_plan_json = ?2 WHERE id = ?1",
+            params![id, plan_json],
+        )?;
         tx.execute(
             "DELETE FROM message_embeddings WHERE message_id = ?1",
             params![id],
@@ -432,6 +455,7 @@ pub fn requeue_misdecoded_bodies(conn: &mut Connection) -> Result<Vec<i64>> {
         // Keep subject/address search available while the corrected body is
         // being fetched, but remove the stale encoded payload from FTS.
         super::search::index_message(&tx, id)?;
+        ids.push(id);
     }
     for thread_id in thread_ids {
         super::threads::recompute(&tx, thread_id)?;
@@ -1160,6 +1184,7 @@ mod tests {
                     size: 100,
                 }],
                 attachments: Vec::new(),
+                recovery_attempted: false,
             }
         }
 
@@ -1213,6 +1238,7 @@ mod tests {
                 size: 100,
             }],
             attachments: Vec::new(),
+            recovery_attempted: false,
         };
         set_mime_plan(&c, legacy_plain_id, Some(&legacy_plain_plan)).unwrap();
         store_body(
@@ -1279,7 +1305,18 @@ mod tests {
                     .iter()
                     .all(|failure| failure.message_id != Some(id))
             );
+            assert!(
+                mime_plan(&c, id)
+                    .unwrap()
+                    .is_some_and(|plan| plan.recovery_attempted)
+            );
         }
+
+        // Once-only: restoring an undecoded payload must not requeue again.
+        for id in [base64_id, qp_id, legacy_plain_id] {
+            store_body(&c, id, None, Some(raw_qp), None, false, Some(raw_qp)).unwrap();
+        }
+        assert!(requeue_misdecoded_bodies(&mut c).unwrap().is_empty());
 
         let good: (String, String) = c
             .query_row(
@@ -1530,6 +1567,7 @@ mod tests {
                 size: 42,
             }],
             attachments: Vec::new(),
+            recovery_attempted: false,
         };
         set_mime_plan(&c, message_id, Some(&plan)).unwrap();
         assert_eq!(mime_plan(&c, message_id).unwrap(), Some(plan.clone()));

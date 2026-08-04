@@ -68,16 +68,19 @@ export function useThread(threadId: number | null) {
     queryFn: () => fetchThread(threadId!),
     enabled: threadId != null,
     staleTime: THREAD_STALE_MS,
+    // Full HTML + inlined CID images; drop unused threads quickly.
+    gcTime: 90_000,
   });
 }
 
-/** Warm the thread cache (hover intent, keyboard selection) so opening it
- *  paints from cache instead of paying the IPC round-trip on click. */
+/** Warm the thread cache (keyboard selection / deliberate hover) so opening
+ *  it paints from cache instead of paying the IPC round-trip on click. */
 export function prefetchThread(threadId: number) {
   void queryClient.prefetchQuery({
     queryKey: ["thread", threadId],
     queryFn: () => fetchThread(threadId),
     staleTime: THREAD_STALE_MS,
+    gcTime: 90_000,
   });
 }
 

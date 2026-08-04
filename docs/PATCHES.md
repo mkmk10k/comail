@@ -18,3 +18,4 @@ FaceTime/WhatsApp presets: already merged on `master` (prior PRs).
 - **RFC 8058** adds `List-Unsubscribe-Post: List-Unsubscribe=One-Click`. Clients MUST POST `List-Unsubscribe=One-Click` as `application/x-www-form-urlencoded`, HTTPS only, no cookies/credentials; senders MUST NOT redirect the POST. Success = HTTP 2xx.
 - **Gmail/Yahoo (2024+) / Microsoft (2025+)** require One-Click for bulk marketing/subscribed mail. DKIM must cover both headers (sender-side).
 - Comail previously opened the URL with GET in a browser and claimed success — wrong verb/layer. Mailto opened a composer and never sent.
+| **memory-caps** | Cap multi-account body backfill (global semaphore, smaller batches, drain yield), AgentMail `.MIME` adaptive fetch, once-only misdecode requeue, leaner SQLite mmap/cache, shorter thread HTML cache | No update path |

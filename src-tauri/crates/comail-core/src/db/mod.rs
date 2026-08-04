@@ -38,12 +38,15 @@ fn open_connection(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
-    // Read-latency tuning: mmap the db file (256 MB window) so page reads
-    // skip the syscall path, keep a 64 MB page cache, and spill temp
-    // b-trees (sorts, group-bys) to memory instead of disk.
-    conn.pragma_update(None, "mmap_size", 268_435_456i64)?;
-    conn.pragma_update(None, "cache_size", -65_536i64)?;
-    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    // Read-latency tuning sized for a mailbox whose bodies live in SQLite
+    // (hundreds of MB on disk). The old 256 MB mmap × 2 connections + 64 MB
+    // page cache reserved a large steady RAM floor even when pages were cold.
+    // 64 MB mmap and a 16 MB cache keep hot paths fast without doubling the
+    // process footprint; temp spills stay on disk so a big GROUP BY cannot
+    // balloon RSS.
+    conn.pragma_update(None, "mmap_size", 67_108_864i64)?;
+    conn.pragma_update(None, "cache_size", -16_384i64)?;
+    conn.pragma_update(None, "temp_store", "FILE")?;
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
     Ok(conn)
 }
