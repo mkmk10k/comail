@@ -515,9 +515,35 @@ async fn send_action(
             move |conn| Ok(repo::folders::by_role(conn, account_id, roles::SENT)?.map(|f| f.id))
         })
         .await?;
+    // Promote staged files into the attachments table NOW. The Sent-folder
+    // header sync may take a while (and for some providers never returns a
+    // BODYSTRUCTURE for our own APPEND), so without this the open message has
+    // has_attachments=1 but zero chips — the exact "I attached a PDF and it
+    // vanished" failure mode.
+    let cache_root = ctx.paths.attachments_dir(config.id);
+    let mut local_atts: Vec<repo::messages::LocalAttachment> =
+        Vec::with_capacity(out.attachments.len());
+    for (i, att) in out.attachments.iter().enumerate() {
+        let sub = cache_root.join(format!("sent-{draft_id}-{i}"));
+        tokio::fs::create_dir_all(&sub)
+            .await
+            .map_err(|e| CoreError::Other(format!("attachment cache: {e}")))?;
+        let safe = sanitize_attachment_filename(&att.filename);
+        let dest = sub.join(&safe);
+        tokio::fs::write(&dest, &att.bytes)
+            .await
+            .map_err(|e| CoreError::Other(format!("attachment cache {}: {e}", att.filename)))?;
+        local_atts.push(repo::messages::LocalAttachment {
+            filename: att.filename.clone(),
+            mime_type: att.mime_type.clone(),
+            size: att.bytes.len() as i64,
+            file_path: dest.to_string_lossy().into_owned(),
+        });
+    }
     // mail-parser strips angle brackets from Message-IDs; store the same form
     // so the Sent-folder sync dedupes against this row instead of duplicating.
     let msg_id_bare = msg_id.trim_matches(['<', '>']).to_string();
+    let att_count = local_atts.len();
     let thread_id = ctx
         .db
         .write(move |conn| {
@@ -532,6 +558,12 @@ async fn send_action(
                 "DELETE FROM drafts_meta WHERE message_id = ?1",
                 rusqlite::params![draft_id],
             )?;
+            // Staging rows are spent; durable copies live under attachments/.
+            tx.execute(
+                "DELETE FROM draft_attachments WHERE draft_id = ?1",
+                rusqlite::params![draft_id],
+            )?;
+            repo::messages::insert_local_attachments(&tx, draft_id, &local_atts)?;
             let tid: Option<i64> =
                 repo::messages::get_row(&tx, draft_id)?.and_then(|r| r.thread_id);
             if let Some(tid) = tid {
@@ -542,6 +574,12 @@ async fn send_action(
             Ok(tid)
         })
         .await?;
+    tracing::debug!(
+        account_id = config.id,
+        draft_id,
+        attachments = att_count,
+        "smtp send: local attachment chips persisted",
+    );
 
     if let Some(tid) = thread_id {
         ctx.bus.emit(CoreEvent::MailUpdated {
@@ -555,6 +593,27 @@ async fn send_action(
         "smtp send: complete",
     );
     Ok(())
+}
+
+/// Filename safe for a local cache path (no path separators / control chars).
+fn sanitize_attachment_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '\\' || c == '\0' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches(['.', ' ']);
+    let base = if trimmed.is_empty() {
+        "attachment"
+    } else {
+        trimmed
+    };
+    base.chars().take(200).collect()
 }
 
 /// Tiny extension-based MIME guess for outgoing attachments.

@@ -81,6 +81,19 @@
       "sentinels": ["FaceTime", "WhatsApp"],
       "notes": "Already on master via merged PRs; verify Join/presets on L3 dogfood",
       "risk": "calendar UI; no update path"
+    },
+    {
+      "id": "sent-attachment-chips",
+      "paths": [
+        "src-tauri/crates/comail-core/src/queue/mod.rs",
+        "src-tauri/crates/comail-core/src/db/repo/messages.rs"
+      ],
+      "sentinels": [
+        "insert_local_attachments",
+        "local attachment chips persisted",
+        "smtp send: local attachment chips"
+      ],
+      "risk": "send path; Sent UI chips without waiting on IMAP BODYSTRUCTURE"
     }
   ],
   "dirty_allowlist": [

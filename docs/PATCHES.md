@@ -8,6 +8,7 @@
 | **one-click-unsubscribe** | RFC 8058 One-Click POST in Rust (`unsubscribe_message`); honest toasts; migration `019_list_unsubscribe_post`; `header_raw` fix for List-Unsubscribe Address parse | No update path |
 | agentmail-archive-to-trash | Archive falls through to Trash when no Archive/All Mail; Shift+E restores | No update path |
 | update-channel-lock | `UPDATE_CHANNEL=locked` refuses check/install until personal channel | **Touches update path** |
+| **sent-attachment-chips** | On SMTP send, copy staged files into `attachments/` and insert `attachments` rows so Sent messages show chips immediately (IMAP BODYSTRUCTURE no longer required for display) | No update path |
 
 FaceTime/WhatsApp presets: already merged on `master` (prior PRs).
 
