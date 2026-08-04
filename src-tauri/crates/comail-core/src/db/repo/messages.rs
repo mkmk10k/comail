@@ -527,6 +527,63 @@ pub struct NewAttachment<'a> {
     pub is_inline: bool,
 }
 
+/// Outgoing attachment already written to a durable local path (composer send).
+/// Inserted so Sent messages show chips immediately; IMAP sync later adopts the
+/// same row by filename when it learns an `imap_section`.
+#[derive(Debug, Clone)]
+pub struct LocalAttachment {
+    pub filename: String,
+    pub mime_type: String,
+    pub size: i64,
+    pub file_path: String,
+}
+
+/// Persist local (already-on-disk) attachments for a just-sent message and flip
+/// `has_attachments`. Idempotent on filename: a re-run updates `file_path` /
+/// size rather than duplicating chips.
+pub fn insert_local_attachments(
+    conn: &Connection,
+    message_id: i64,
+    atts: &[LocalAttachment],
+) -> Result<Vec<i64>> {
+    let mut ids = Vec::with_capacity(atts.len());
+    for a in atts {
+        let existing = conn
+            .query_row(
+                "SELECT id FROM attachments
+                 WHERE message_id = ?1 AND filename = ?2 AND is_inline = 0
+                 ORDER BY (file_path IS NOT NULL) DESC, id
+                 LIMIT 1",
+                params![message_id, a.filename],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let id = if let Some(id) = existing {
+            conn.execute(
+                "UPDATE attachments
+                 SET mime_type = ?2, size = ?3, file_path = ?4, is_inline = 0
+                 WHERE id = ?1",
+                params![id, a.mime_type, a.size, a.file_path],
+            )?;
+            id
+        } else {
+            conn.execute(
+                "INSERT INTO attachments (
+                   message_id, filename, mime_type, size, is_inline, file_path
+                 ) VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+                params![message_id, a.filename, a.mime_type, a.size, a.file_path],
+            )?;
+            conn.last_insert_rowid()
+        };
+        ids.push(id);
+    }
+    conn.execute(
+        "UPDATE messages SET has_attachments = ?2 WHERE id = ?1",
+        params![message_id, (!atts.is_empty()) as i64],
+    )?;
+    Ok(ids)
+}
+
 pub fn replace_attachments(
     conn: &Connection,
     message_id: i64,
@@ -1570,5 +1627,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, "July invoice");
+    }
+
+    /// Sent-message chips: promoting a staged PDF must land in detail() so the
+    /// thread UI can render it without waiting on IMAP BODYSTRUCTURE.
+    #[test]
+    fn insert_local_attachments_surfaces_in_detail_and_survives_plan_upsert() {
+        let c = testutil::conn();
+        testutil::seed_account(&c);
+        let (_thread_id, message_id) = testutil::seed_message(&c, "me@test.dev", "Re: doc", false);
+        let ids = insert_local_attachments(
+            &c,
+            message_id,
+            &[LocalAttachment {
+                filename: "Rauta Product Approach.pdf".into(),
+                mime_type: "application/pdf".into(),
+                size: 206_490,
+                file_path: "/tmp/comail-sent/Rauta Product Approach.pdf".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(ids.len(), 1);
+
+        let shown = detail(&c, message_id).unwrap();
+        assert_eq!(shown.attachments.len(), 1);
+        assert_eq!(
+            shown.attachments[0].filename.as_deref(),
+            Some("Rauta Product Approach.pdf")
+        );
+        assert!(!shown.attachments[0].is_inline);
+        let flagged: i64 = c
+            .query_row(
+                "SELECT has_attachments FROM messages WHERE id = ?1",
+                params![message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(flagged, 1);
+
+        // Later Sent sync adopts the same row (no duplicate chip).
+        let planned = PlannedAttachment {
+            section: "2".into(),
+            filename: Some("Rauta Product Approach.pdf".into()),
+            mime_type: "application/pdf".into(),
+            size: 206_490,
+            content_id: None,
+            is_inline: false,
+            transfer_encoding: "base64".into(),
+        };
+        assert_eq!(
+            upsert_planned_attachments(&c, message_id, &[planned]).unwrap(),
+            ids
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT COUNT(*) FROM attachments WHERE message_id = ?1",
+                params![message_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        let path: String = c
+            .query_row(
+                "SELECT file_path FROM attachments WHERE id = ?1",
+                params![ids[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(path, "/tmp/comail-sent/Rauta Product Approach.pdf");
     }
 }
