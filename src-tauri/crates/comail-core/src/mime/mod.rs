@@ -53,6 +53,11 @@ pub struct MimePlan {
     pub text_sections: Vec<PlannedTextSection>,
     #[serde(default)]
     pub attachments: Vec<PlannedAttachment>,
+    /// Set when startup misdecode recovery has already requeued this plan.
+    /// Stops a false-positive QP/Base64 scan from deleting the same body on
+    /// every launch (a real memory + IMAP storm with many accounts).
+    #[serde(default)]
+    pub recovery_attempted: bool,
 }
 
 impl Default for MimePlan {
@@ -61,6 +66,7 @@ impl Default for MimePlan {
             version: MIME_PLAN_VERSION,
             text_sections: Vec::new(),
             attachments: Vec::new(),
+            recovery_attempted: false,
         }
     }
 }
@@ -352,11 +358,30 @@ fn qp_artifact_count(content: &str) -> usize {
 }
 
 /// Conservatively identify cached text that still contains a transfer-encoded
-/// quoted-printable body. The threshold intentionally matches selective
-/// decoding's repair gate: isolated `=XX` strings are common in legitimate
-/// prose, while eight escapes strongly indicate an undecoded MIME part.
+/// quoted-printable body. Eight uppercase `=XX` escapes are necessary but not
+/// sufficient on their own: require a QP soft-break, a few `=3D` attribute
+/// leftovers, or a high escape density without a decoded HTML scaffold. The
+/// looser "any eight escapes" gate requeued hundreds of healthy bodies every
+/// launch and drove multi-account backfill RAM spikes.
 pub fn looks_like_undecoded_quoted_printable(content: &str) -> bool {
-    qp_artifact_count(content) >= 8
+    let artifacts = qp_artifact_count(content);
+    if artifacts < 8 {
+        return false;
+    }
+    let soft_breaks = content.matches("=\r\n").count() + content.matches("=\n").count();
+    if soft_breaks >= 2 {
+        return true;
+    }
+    let eq3d = content.matches("=3D").count();
+    if eq3d >= 3 {
+        return true;
+    }
+    let lower = content.to_ascii_lowercase();
+    let looks_decoded_html = lower.contains("<html") || lower.contains("<body");
+    if eq3d >= 1 && !looks_decoded_html {
+        return true;
+    }
+    artifacts >= 32 && !looks_decoded_html
 }
 
 /// Quoted-printable decoding that never fails: valid `=XX` escapes decode,

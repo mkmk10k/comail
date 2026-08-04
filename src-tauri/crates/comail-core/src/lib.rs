@@ -35,7 +35,9 @@ use crate::error::{CoreError, Result};
 use crate::events::{CoreEvent, EventBus};
 use crate::models::*;
 use crate::oauth::tokens::TokenProvider;
-use crate::sync::engine::{AccountHandle, SyncCmd, SyncCtx, spawn_account};
+use crate::sync::engine::{
+    AccountHandle, SyncCmd, SyncCtx, new_body_backfill_slots, spawn_account,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -124,6 +126,8 @@ pub struct Core {
     /// Serializes AI routing passes so the background router and an inline
     /// re-sort never classify the same 'pending' threads twice.
     ai_router_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Process-wide cap on concurrent selective body backfill workers.
+    body_backfill_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl Core {
@@ -143,6 +147,7 @@ impl Core {
             oauth_cancel: Arc::new(tokio::sync::Notify::new()),
             ui_ready: Arc::new(tokio::sync::Notify::new()),
             ai_router_lock: Arc::new(tokio::sync::Mutex::new(())),
+            body_backfill_slots: new_body_backfill_slots(),
         };
 
         // Make saved OAuth app registrations available before any actor
@@ -350,12 +355,13 @@ impl Core {
     }
 
     fn sync_ctx(&self) -> SyncCtx {
-        SyncCtx {
-            db: self.db.clone(),
-            bus: self.bus.clone(),
-            paths: self.paths.clone(),
-            tokens: self.tokens.clone(),
-        }
+        SyncCtx::new(
+            self.db.clone(),
+            self.bus.clone(),
+            self.paths.clone(),
+            self.tokens.clone(),
+            self.body_backfill_slots.clone(),
+        )
     }
 
     async fn spawn_actor(&self, cfg: AccountConfig) {

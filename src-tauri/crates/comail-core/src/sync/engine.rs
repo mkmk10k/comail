@@ -26,7 +26,8 @@ use crate::oauth::tokens::TokenProvider;
 use crate::queue;
 use rusqlite::OptionalExtension;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
 const BACKFILL_DAYS: i64 = 90;
 const HEADER_CHUNK: usize = 200;
@@ -34,20 +35,30 @@ const HEADER_CHUNK: usize = 200;
 /// dedicated reader connection.
 const PRIORITY_BODY_FETCH_CHUNK: usize = 25;
 /// Background selective reads are grouped into one multi-UID FETCH whenever
-/// their MIME section layouts match. A large UID batch removes the per-message
-/// network round trip and permits hundreds of small messages per second on a
-/// fast server.
-const BODY_FETCH_CHUNK: usize = 200;
-/// Bound one selective response independently of message count. Two workers at
-/// this ceiling use modest memory while still allowing high-throughput bursts.
-const MAX_SELECTIVE_BATCH_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_MICROSOFT_BATCH_BYTES: u64 = 4 * 1024 * 1024;
-/// Concurrent IMAP connections dedicated to bulk body backfill. Together with
-/// the sync actor and the on-demand reader that's BODY_POOL_CONNS + 2
-/// connections per account, well under common server caps (Gmail allows 15).
-const BODY_POOL_CONNS: usize = 2;
+/// their MIME section layouts match. Kept modest so multi-account drains do
+/// not hold many multi-MB wire buffers at once (was 200 / 8 MiB).
+const BODY_FETCH_CHUNK: usize = 80;
+/// Bound one selective response independently of message count.
+const MAX_SELECTIVE_BATCH_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_MICROSOFT_BATCH_BYTES: u64 = 2 * 1024 * 1024;
+/// Concurrent IMAP connections dedicated to bulk body backfill *per account*.
+/// Global concurrency is further capped by [`GLOBAL_BODY_BACKFILL_SLOTS`].
+const BODY_POOL_CONNS: usize = 1;
+/// Process-wide ceiling on concurrent selective body fetches across every
+/// account. With 9 accounts × 2 workers × 8 MiB the peak was ~144 MiB of wire
+/// buffers alone, plus decode copies.
+const GLOBAL_BODY_BACKFILL_SLOTS: usize = 3;
+/// Newest-first bodies to queue per folder per drain round. Yields so IDLE /
+/// priority reads stay responsive and RSS does not climb for minutes.
+const BODY_DRAIN_PER_FOLDER: i64 = 120;
+/// Max folder chunks queued in one drain round across the whole account.
+const BODY_DRAIN_MAX_CHUNKS: usize = 6;
 const HISTORY_CHUNK: u32 = 500;
 const CYCLE_SECS: u64 = 60;
+/// First back-off when a drain makes no progress (AgentMail `.MIME` BAD used
+/// to spin every 60s forever). Doubles up to [`NO_PROGRESS_BACKOFF_MAX_SECS`].
+const NO_PROGRESS_BACKOFF_SECS: u64 = 120;
+const NO_PROGRESS_BACKOFF_MAX_SECS: u64 = 30 * 60;
 /// Poll cadence when the server does not support IDLE (near-real-time push).
 const IDLE_FALLBACK_SECS: u64 = 20;
 /// Re-issue IDLE at least this often (RFC 2177 recommends < 29 min) to keep the
@@ -138,6 +149,50 @@ pub struct SyncCtx {
     pub bus: EventBus,
     pub paths: Arc<Paths>,
     pub tokens: TokenProvider,
+    /// Shared across every account's body workers. Created once in `Core`.
+    pub body_backfill_slots: Arc<Semaphore>,
+    /// Set once this account's server has refused `BODY.PEEK[<section>.MIME]`,
+    /// so later fetches omit the item instead of paying a guaranteed-BAD
+    /// round trip (AgentMail). Per-account; never cleared.
+    pub section_mime_unsupported: Arc<AtomicBool>,
+}
+
+impl SyncCtx {
+    pub fn new(
+        db: Db,
+        bus: EventBus,
+        paths: Arc<Paths>,
+        tokens: TokenProvider,
+        body_backfill_slots: Arc<Semaphore>,
+    ) -> Self {
+        Self {
+            db,
+            bus,
+            paths,
+            tokens,
+            body_backfill_slots,
+            section_mime_unsupported: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn mime_header_mode(&self) -> imap::MimeHeaderMode {
+        if self.section_mime_unsupported.load(Ordering::Relaxed) {
+            imap::MimeHeaderMode::Omit
+        } else {
+            imap::MimeHeaderMode::Include
+        }
+    }
+
+    fn note_mime_header_mode(&self, mode: imap::MimeHeaderMode) {
+        if mode == imap::MimeHeaderMode::Omit {
+            self.section_mime_unsupported.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Shared permit pool for `Core` to clone into each account's `SyncCtx`.
+pub fn new_body_backfill_slots() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(GLOBAL_BODY_BACKFILL_SLOTS))
 }
 
 pub fn spawn_account(ctx: SyncCtx, config: AccountConfig) -> AccountHandle {
@@ -2087,15 +2142,19 @@ mod content_batch_tests {
                     size,
                 }],
                 attachments: Vec::new(),
+                recovery_attempted: false,
             },
         }
     }
 
     #[test]
-    fn batch_packing_uses_two_fetches_for_three_hundred_small_messages() {
-        let items = (1..=300).map(|id| item(id, 1_000)).collect();
+    fn batch_packing_caps_uid_count_and_byte_budget() {
+        let items = (1..=200).map(|id| item(id, 1_000)).collect();
         let batches = selective_fetch_batches(items, MAX_SELECTIVE_BATCH_BYTES);
-        assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [200, 100]);
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            [BODY_FETCH_CHUNK, BODY_FETCH_CHUNK, 40]
+        );
     }
 
     #[test]
@@ -2183,140 +2242,160 @@ async fn run_backfill_pool(
     mut rx: mpsc::UnboundedReceiver<()>,
 ) {
     let account_id = config.id;
+    let mut no_progress_backoff: Option<u64> = None;
     loop {
+        // Healthy cadence is CYCLE_SECS. After a no-progress drain (typical when
+        // a server rejects every selective FETCH), grow the sleep so we do not
+        // reconnect nine accounts every minute for nothing.
+        let wait_secs = no_progress_backoff.unwrap_or(CYCLE_SECS);
         if let Ok(None) =
-            tokio::time::timeout(std::time::Duration::from_secs(CYCLE_SECS), rx.recv()).await
+            tokio::time::timeout(std::time::Duration::from_secs(wait_secs), rx.recv()).await
         {
             return; // channel closed: account removed / shutdown
         }
         // Coalesce nudges that piled up while the previous drain ran.
         while rx.try_recv().is_ok() {}
-        if let Err(e) = drain_missing_bodies(&ctx, &config).await {
-            tracing::warn!(account_id, error = %e, "body backfill: drain failed");
+        match drain_missing_bodies(&ctx, &config).await {
+            Ok(()) => {
+                no_progress_backoff = None;
+            }
+            Err(e) => {
+                let no_progress = e.to_string().contains("body backfill made no progress");
+                if no_progress {
+                    let next = no_progress_backoff
+                        .map(|secs| secs.saturating_mul(2).min(NO_PROGRESS_BACKOFF_MAX_SECS))
+                        .unwrap_or(NO_PROGRESS_BACKOFF_SECS);
+                    tracing::warn!(
+                        account_id,
+                        backoff_secs = next,
+                        error = %e,
+                        "body backfill: no progress; backing off"
+                    );
+                    no_progress_backoff = Some(next);
+                } else {
+                    tracing::warn!(account_id, error = %e, "body backfill: drain failed");
+                }
+            }
         }
     }
 }
 
-/// Fetch ALL missing bodies for the account, inbox first, by handing
-/// folder-grouped chunks to a shared queue serviced by up to BODY_POOL_CONNS
-/// parallel connections. Loops until a scan finds nothing left; bails out when
-/// a full round makes no forward progress (server unreachable, or every
-/// remaining UID vanished) so it can't spin - the next nudge or backstop tick
-/// retries.
+/// Fetch a capped newest-first slice of missing bodies for the account, inbox
+/// first, via up to BODY_POOL_CONNS workers gated by the process-wide semaphore.
+/// One round per nudge/tick; remaining work waits for the next cycle. Bails
+/// when a round makes no forward progress so the pool can back off.
 async fn drain_missing_bodies(ctx: &SyncCtx, config: &AccountConfig) -> Result<()> {
     use std::collections::{HashSet, VecDeque};
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     let account_id = config.id;
     // Message ids attempted this drain whose bodies the server didn't return
     // (expunged mid-sync): skipped for the rest of the drain so it terminates;
     // expunge reconciliation removes the rows.
     let skip: Arc<std::sync::Mutex<HashSet<i64>>> = Arc::default();
-    let mut did_work = false;
 
-    loop {
-        let folders = ctx
+    let folders = ctx
+        .db
+        .read(move |conn| repo::folders::list(conn, Some(account_id)))
+        .await?;
+    let mut ordered: Vec<&Folder> = folders.iter().collect();
+    ordered.sort_by_key(|f| match f.role.as_deref() {
+        Some(roles::INBOX) => 0,
+        Some(roles::SENT) => 1,
+        _ => 2,
+    });
+
+    let mut chunks: VecDeque<BodyChunk> = VecDeque::new();
+    for folder in ordered {
+        if folder.role.as_deref() == Some(roles::ALL) && config.provider != Provider::Gmail {
+            continue;
+        }
+        if chunks.len() >= BODY_DRAIN_MAX_CHUNKS {
+            break;
+        }
+        let fid = folder.id;
+        let missing = ctx
             .db
-            .read(move |conn| repo::folders::list(conn, Some(account_id)))
+            .read(move |conn| repo::messages::missing_bodies(conn, fid, BODY_DRAIN_PER_FOLDER))
             .await?;
-        let mut ordered: Vec<&Folder> = folders.iter().collect();
-        ordered.sort_by_key(|f| match f.role.as_deref() {
-            Some(roles::INBOX) => 0,
-            Some(roles::SENT) => 1,
-            _ => 2,
-        });
-
-        let mut chunks: VecDeque<BodyChunk> = VecDeque::new();
-        for folder in ordered {
-            if folder.role.as_deref() == Some(roles::ALL) && config.provider != Provider::Gmail {
-                continue;
-            }
-            let fid = folder.id;
-            let missing = ctx
-                .db
-                .read(move |conn| repo::messages::missing_bodies(conn, fid, i64::MAX))
-                .await?;
-            let missing: Vec<(i64, i64)> = {
-                let skip = skip.lock().unwrap();
-                missing
-                    .into_iter()
-                    .filter(|(mid, _)| !skip.contains(mid))
-                    .collect()
-            };
-            for chunk in missing.chunks(BODY_FETCH_CHUNK) {
-                chunks.push_back(BodyChunk {
-                    folder_id: folder.id,
-                    folder_name: folder.imap_name.clone(),
-                    uid_validity: folder.uidvalidity,
-                    items: chunk.to_vec(),
-                });
-            }
-        }
-
-        if chunks.is_empty() {
-            if did_work {
-                tracing::info!(account_id, "body backfill: drained");
-            }
-            return Ok(());
-        }
-        did_work = true;
-        tracing::debug!(
-            account_id,
-            chunks = chunks.len(),
-            "body backfill: starting round"
-        );
-
-        // Fan the queue out to a pool of connections. Each worker owns its own
-        // session and pops chunks until the queue is empty or its connection
-        // breaks, so a slow chunk never stalls the others. Office 365 throttles
-        // concurrent IMAP FETCH streams hard (it resets extra connections), so
-        // it gets a smaller pool - more workers there just die and burn
-        // reconnect round-trips.
-        let cap = match config.provider {
-            Provider::Microsoft => 1,
-            _ => BODY_POOL_CONNS,
+        let missing: Vec<(i64, i64)> = {
+            let skip = skip.lock().unwrap();
+            missing
+                .into_iter()
+                .filter(|(mid, _)| !skip.contains(mid))
+                .collect()
         };
-        let workers = cap.min(chunks.len());
-        let queue = Arc::new(tokio::sync::Mutex::new(chunks));
-        let persisted = Arc::new(AtomicU64::new(0));
-        let mut handles = Vec::with_capacity(workers);
-        for _ in 0..workers {
-            handles.push(tokio::spawn(body_worker(
-                ctx.clone(),
-                config.clone(),
-                queue.clone(),
-                skip.clone(),
-                persisted.clone(),
-            )));
+        for chunk in missing.chunks(BODY_FETCH_CHUNK) {
+            chunks.push_back(BodyChunk {
+                folder_id: folder.id,
+                folder_name: folder.imap_name.clone(),
+                uid_validity: folder.uidvalidity,
+                items: chunk.to_vec(),
+            });
+            if chunks.len() >= BODY_DRAIN_MAX_CHUNKS {
+                break;
+            }
         }
-        let mut worker_error = None;
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    if worker_error.is_none() {
-                        worker_error = Some(error);
-                    }
+    }
+
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    tracing::debug!(
+        account_id,
+        chunks = chunks.len(),
+        "body backfill: starting round"
+    );
+
+    // Fan the queue out to a pool of connections. Each worker owns its own
+    // session and pops chunks until the queue is empty or its connection
+    // breaks, so a slow chunk never stalls the others. Office 365 throttles
+    // concurrent IMAP FETCH streams hard (it resets extra connections), so
+    // it gets a smaller pool - more workers there just die and burn
+    // reconnect round-trips. Global semaphore further caps process RSS.
+    let cap = match config.provider {
+        Provider::Microsoft => 1,
+        _ => BODY_POOL_CONNS,
+    };
+    let workers = cap.min(chunks.len());
+    let queue = Arc::new(tokio::sync::Mutex::new(chunks));
+    let persisted = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        handles.push(tokio::spawn(body_worker(
+            ctx.clone(),
+            config.clone(),
+            queue.clone(),
+            skip.clone(),
+            persisted.clone(),
+        )));
+    }
+    let mut worker_error = None;
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if worker_error.is_none() {
+                    worker_error = Some(error);
                 }
-                Err(error) => {
-                    if worker_error.is_none() {
-                        worker_error = Some(CoreError::Other(format!(
-                            "body worker task failed: {error}"
-                        )));
-                    }
+            }
+            Err(error) => {
+                if worker_error.is_none() {
+                    worker_error = Some(CoreError::Other(format!(
+                        "body worker task failed: {error}"
+                    )));
                 }
             }
         }
-        if let Some(error) = worker_error {
-            return Err(error);
-        }
-        if persisted.load(Ordering::Relaxed) == 0 {
-            return Err(CoreError::Imap(
-                "body backfill made no progress; will retry".into(),
-            ));
-        }
-        // Re-scan: headers that landed while this round ran get picked up too.
     }
+    if let Some(error) = worker_error {
+        return Err(error);
+    }
+    if persisted.load(Ordering::Relaxed) == 0 {
+        return Err(CoreError::Imap(
+            "body backfill made no progress; will retry".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// One backfill-pool connection: pops chunks off the shared queue until it is
@@ -2341,6 +2420,13 @@ async fn body_worker(
     loop {
         let chunk = queue.lock().await.pop_front();
         let Some(chunk) = chunk else { break };
+        // Hold a global slot only while fetching/decoding so idle connections
+        // across many accounts do not reserve memory budget.
+        let _slot = ctx
+            .body_backfill_slots
+            .acquire()
+            .await
+            .map_err(|_| CoreError::Other("body backfill slots closed".into()))?;
         let chunk_started = std::time::Instant::now();
         match fetch_body_chunk(&ctx, &config, &mut session, &mut selected, &chunk, &skip).await {
             Ok(n) => {
@@ -2526,10 +2612,17 @@ async fn fetch_body_chunk(
                 continue;
             }
             let uids: Vec<u32> = batch.iter().map(|item| item.uid).collect();
-            let fetched = imap::fetch_content_sections_batch(session, &uids, &sections)
-                .await
-                .map_err(BodyChunkError::Reconnect)?;
+            let fetched = imap::fetch_content_sections_batch_adaptive(
+                session,
+                &uids,
+                &sections,
+                ctx.mime_header_mode(),
+            )
+            .await
+            .map_err(BodyChunkError::Reconnect)?;
+            ctx.note_mime_header_mode(fetched.mode);
             let mut by_uid: std::collections::HashMap<_, _> = fetched
+                .messages
                 .into_iter()
                 .map(|message| (message.uid, message.sections))
                 .collect();
@@ -2927,7 +3020,14 @@ async fn fetch_selective_content(
             ));
         }
         let section_ids = plan.text_section_ids();
-        let fetched = imap::fetch_content_sections(session, uid, &section_ids).await?;
+        let (fetched, mode) = imap::fetch_content_sections_adaptive(
+            session,
+            uid,
+            &section_ids,
+            ctx.mime_header_mode(),
+        )
+        .await?;
+        ctx.note_mime_header_mode(mode);
         decode_selective_content(
             PlannedBodyFetch {
                 message_id,
