@@ -133,6 +133,18 @@
         "NO_PROGRESS_BACKOFF_SECS"
       ],
       "risk": "sync + SQLite pragmas + React Query retention; no update path"
+    },
+    {
+      "id": "event-create-modal-scroll",
+      "paths": [
+        "src/components/calendar/EventCreate.tsx"
+      ],
+      "sentinels": [
+        "Form body scrolls inside the viewport",
+        "max-h-full",
+        "overflow-y-auto"
+      ],
+      "risk": "calendar create modal layout; no update path"
     }
   ],
   "dirty_allowlist": [
