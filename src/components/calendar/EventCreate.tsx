@@ -410,7 +410,7 @@ export function EventCreate() {
 
   return (
     <div
-      className="co-overlay flex items-start justify-center pt-[12vh]"
+      className="co-overlay flex items-center justify-center p-[4vh]"
       onMouseDown={close}
       onKeyDown={(e) => {
         if (e.key === "Escape") {
@@ -424,232 +424,236 @@ export function EventCreate() {
     >
       <div
         data-testid="event-create"
-        className="co-fade-in w-[520px] rounded-xl border border-hairline bg-bg1 p-4"
+        className="co-fade-in flex max-h-full w-[520px] flex-col rounded-xl border border-hairline bg-bg1"
         style={{ boxShadow: "var(--elev-2)" }}
         onMouseDown={(e) => e.stopPropagation()}
       >
-        <header className="flex items-center justify-between">
+        {/* Header stays pinned so save is always reachable without resizing. */}
+        <header className="flex shrink-0 items-center justify-between px-4 pt-4">
           <h2 className="text-[14px] font-semibold text-ink">
             {t(editingId != null ? "calendar:edit.title" : "calendar:create.title")}
           </h2>
           <span className="text-[11.5px] text-ink-faint">{t("calendar:create.saveHint")}</span>
         </header>
-        <div className="-mx-4 mt-3 mb-3 border-b border-hairline" />
+        <div className="mx-4 mt-3 shrink-0 border-b border-hairline" />
 
-        {/* Smart quick-add: natural language fills the form below. */}
-        <div className="relative">
-          <span className="pointer-events-none absolute top-1/2 left-2.5 -translate-y-1/2 text-accent">
-            {ICON.sparkle}
-          </span>
-          <input
-            ref={quickRef}
-            autoComplete="off"
-            autoCorrect="off"
-            autoCapitalize="off"
-            spellCheck={false}
-            name="event-quickadd"
-            className="w-full rounded-lg border border-accent/40 bg-accent/[0.05] py-2 pr-9 pl-8 text-[13px] text-ink outline-none transition placeholder:text-ink-faint focus:border-accent/70 focus-visible:outline-none"
-            placeholder={t("calendar:create.quickPlaceholder")}
-            value={quick}
-            onChange={(e) => setQuick(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.metaKey && !e.ctrlKey) {
-                e.preventDefault();
-                if (quickPreview) applyQuick();
-                else void quickAi();
-              }
-            }}
-          />
-          {quickAiPending || teamsPending ? (
-            <span className="co-spinner absolute top-1/2 right-2.5 size-3.5 -translate-y-1/2 rounded-full border-[1.5px] border-hairline-strong border-t-accent" />
-          ) : (
-            quick && (
-              <button
-                type="button"
-                onClick={() => {
-                  setQuick("");
-                  quickRef.current?.focus();
-                }}
-                title={t("common:action.clear")}
-                aria-label={t("common:action.clear")}
-                className="absolute top-1/2 right-2 flex size-5 -translate-y-1/2 items-center justify-center rounded-full text-ink-faint transition hover:bg-accent/10 hover:text-ink"
-              >
-                {ICON.close}
-              </button>
-            )
-          )}
-        </div>
-        <div className="mt-1 mb-3 h-4 px-1 text-[11.5px] text-accent">
-          {!quickPreview && quickAiPending && <span>{t("calendar:create.quickAiPending")}</span>}
-          {!quickPreview && !quickAiPending && quick.trim().length >= 3 && (
-            <span className="text-ink-faint">{t("calendar:create.quickAiHint")}</span>
-          )}
-          {quickPreview && (
-            <>
-              {quickPreview.summary} ·{" "}
-              {new Date(quickPreview.startsAt).toLocaleString(i18n.language, {
-                weekday: "short",
-                month: "short",
-                day: "numeric",
-                ...(quickPreview.allDay ? {} : { hour: "2-digit", minute: "2-digit" }),
-              })}{" "}
- - {t("calendar:create.quickApply")}
-            </>
-          )}
-        </div>
-
-        <div className="flex flex-col gap-4">
-          {/* Title */}
-          <div>
-            <FieldLabel icon={ICON.title}>{t("calendar:create.summary")}</FieldLabel>
+        {/* Form body scrolls inside the viewport; footer stays visible below. */}
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 pt-3 pb-1">
+          {/* Smart quick-add: natural language fills the form below. */}
+          <div className="relative">
+            <span className="pointer-events-none absolute top-1/2 left-2.5 -translate-y-1/2 text-accent">
+              {ICON.sparkle}
+            </span>
             <input
-              className={inputCls}
-              value={summary}
-              onChange={(e) => setSummary(e.target.value)}
+              ref={quickRef}
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              name="event-quickadd"
+              className="w-full rounded-lg border border-accent/40 bg-accent/[0.05] py-2 pr-9 pl-8 text-[13px] text-ink outline-none transition placeholder:text-ink-faint focus:border-accent/70 focus-visible:outline-none"
+              placeholder={t("calendar:create.quickPlaceholder")}
+              value={quick}
+              onChange={(e) => setQuick(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.metaKey && !e.ctrlKey) {
+                  e.preventDefault();
+                  if (quickPreview) applyQuick();
+                  else void quickAi();
+                }
+              }}
             />
+            {quickAiPending || teamsPending ? (
+              <span className="co-spinner absolute top-1/2 right-2.5 size-3.5 -translate-y-1/2 rounded-full border-[1.5px] border-hairline-strong border-t-accent" />
+            ) : (
+              quick && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setQuick("");
+                    quickRef.current?.focus();
+                  }}
+                  title={t("common:action.clear")}
+                  aria-label={t("common:action.clear")}
+                  className="absolute top-1/2 right-2 flex size-5 -translate-y-1/2 items-center justify-center rounded-full text-ink-faint transition hover:bg-accent/10 hover:text-ink"
+                >
+                  {ICON.close}
+                </button>
+              )
+            )}
+          </div>
+          <div className="mt-1 mb-3 h-4 px-1 text-[11.5px] text-accent">
+            {!quickPreview && quickAiPending && <span>{t("calendar:create.quickAiPending")}</span>}
+            {!quickPreview && !quickAiPending && quick.trim().length >= 3 && (
+              <span className="text-ink-faint">{t("calendar:create.quickAiHint")}</span>
+            )}
+            {quickPreview && (
+              <>
+                {quickPreview.summary} ·{" "}
+                {new Date(quickPreview.startsAt).toLocaleString(i18n.language, {
+                  weekday: "short",
+                  month: "short",
+                  day: "numeric",
+                  ...(quickPreview.allDay ? {} : { hour: "2-digit", minute: "2-digit" }),
+                })}{" "}
+                · {t("calendar:create.quickApply")}
+              </>
+            )}
           </div>
 
-          {/* WHEN */}
-          <div>
-            <SectionLabel>{t("calendar:create.section.when")}</SectionLabel>
-            <div className="flex items-end gap-2">
-              <div className="w-40">
-                <FieldLabel icon={ICON.date}>{t("calendar:create.date")}</FieldLabel>
-                <input
-                  type="date"
-                  className={inputCls}
-                  value={date}
-                  onChange={(e) => setDate(e.target.value)}
-                />
-              </div>
-              {!allDay && (
-                <>
-                  <div className="w-[6.5rem]">
-                    <FieldLabel icon={ICON.time}>{t("calendar:create.start")}</FieldLabel>
-                    <input
-                      type="time"
-                      className={inputCls}
-                      value={time}
-                      onChange={(e) => changeStart(e.target.value)}
-                    />
-                  </div>
-                  <div className="w-[6.5rem]">
-                    <FieldLabel icon={ICON.duration}>{t("calendar:create.end")}</FieldLabel>
-                    <input
-                      type="time"
-                      className={inputCls}
-                      value={endTime}
-                      onChange={(e) => setEndTime(e.target.value)}
-                    />
-                  </div>
-                  <span className="pb-2 text-[11.5px] whitespace-nowrap text-ink-faint">
-                    {formatDuration(
-                      endsFromInputs(fromInputs(date, time)) - fromInputs(date, time),
-                    )}
-                  </span>
-                </>
-              )}
-              <label className="ml-auto flex items-center gap-1.5 pb-2 text-[12px] text-ink-muted select-none">
-                <input
-                  type="checkbox"
-                  checked={allDay}
-                  onChange={(e) => setAllDay(e.target.checked)}
-                />
-                {t("calendar:allDay")}
-              </label>
-            </div>
-          </div>
-
-          {/* WHO */}
-          <div>
-            <SectionLabel>{t("calendar:create.section.who")}</SectionLabel>
-            <FieldLabel icon={ICON.users}>{t("calendar:create.attendees")}</FieldLabel>
-            <input
-              className={inputCls}
-              placeholder={t("calendar:create.attendeesPlaceholder")}
-              value={attendeesRaw}
-              onChange={(e) => setAttendeesRaw(e.target.value)}
-            />
-          </div>
-
-          {/* WHERE — stacked so FaceTime / WhatsApp presets stay visible */}
-          <div className="space-y-2.5">
-            <SectionLabel>{t("calendar:create.section.where")}</SectionLabel>
+          <div className="flex flex-col gap-4">
+            {/* Title */}
             <div>
-              <FieldLabel icon={ICON.location}>{t("calendar:create.location")}</FieldLabel>
+              <FieldLabel icon={ICON.title}>{t("calendar:create.summary")}</FieldLabel>
               <input
                 className={inputCls}
-                value={location}
-                onChange={(e) => setLocation(e.target.value)}
+                value={summary}
+                onChange={(e) => setSummary(e.target.value)}
               />
             </div>
+
+            {/* WHEN */}
             <div>
-              <FieldLabel icon={ICON.link}>{t("calendar:create.joinUrl")}</FieldLabel>
-              <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => fillCallLink("facetime")}
-                  title={t("calendar:create.facetimeTip")}
-                  className="inline-flex items-center gap-1 rounded-full border border-hairline bg-bg2/60 px-2.5 py-1 text-[11.5px] font-medium text-ink-muted transition hover:border-accent/30 hover:bg-accent/[0.06] hover:text-accent"
-                >
-                  {t("calendar:create.facetime")}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => fillCallLink("whatsapp")}
-                  title={t("calendar:create.whatsappTip")}
-                  className="inline-flex items-center gap-1 rounded-full border border-hairline bg-bg2/60 px-2.5 py-1 text-[11.5px] font-medium text-ink-muted transition hover:border-accent/30 hover:bg-accent/[0.06] hover:text-accent"
-                >
-                  {t("calendar:create.whatsapp")}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => fillCallLink("both")}
-                  title={t("calendar:create.bothCallsTip")}
-                  className="inline-flex items-center gap-1 rounded-full border border-hairline bg-bg2/60 px-2.5 py-1 text-[11.5px] font-medium text-ink-muted transition hover:border-accent/30 hover:bg-accent/[0.06] hover:text-accent"
-                >
-                  {t("calendar:create.bothCalls")}
-                </button>
-                {isMicrosoftAccount && (
+              <SectionLabel>{t("calendar:create.section.when")}</SectionLabel>
+              <div className="flex items-end gap-2">
+                <div className="w-40">
+                  <FieldLabel icon={ICON.date}>{t("calendar:create.date")}</FieldLabel>
+                  <input
+                    type="date"
+                    className={inputCls}
+                    value={date}
+                    onChange={(e) => setDate(e.target.value)}
+                  />
+                </div>
+                {!allDay && (
+                  <>
+                    <div className="w-[6.5rem]">
+                      <FieldLabel icon={ICON.time}>{t("calendar:create.start")}</FieldLabel>
+                      <input
+                        type="time"
+                        className={inputCls}
+                        value={time}
+                        onChange={(e) => changeStart(e.target.value)}
+                      />
+                    </div>
+                    <div className="w-[6.5rem]">
+                      <FieldLabel icon={ICON.duration}>{t("calendar:create.end")}</FieldLabel>
+                      <input
+                        type="time"
+                        className={inputCls}
+                        value={endTime}
+                        onChange={(e) => setEndTime(e.target.value)}
+                      />
+                    </div>
+                    <span className="pb-2 text-[11.5px] whitespace-nowrap text-ink-faint">
+                      {formatDuration(
+                        endsFromInputs(fromInputs(date, time)) - fromInputs(date, time),
+                      )}
+                    </span>
+                  </>
+                )}
+                <label className="ml-auto flex items-center gap-1.5 pb-2 text-[12px] text-ink-muted select-none">
+                  <input
+                    type="checkbox"
+                    checked={allDay}
+                    onChange={(e) => setAllDay(e.target.checked)}
+                  />
+                  {t("calendar:allDay")}
+                </label>
+              </div>
+            </div>
+
+            {/* WHO */}
+            <div>
+              <SectionLabel>{t("calendar:create.section.who")}</SectionLabel>
+              <FieldLabel icon={ICON.users}>{t("calendar:create.attendees")}</FieldLabel>
+              <input
+                className={inputCls}
+                placeholder={t("calendar:create.attendeesPlaceholder")}
+                value={attendeesRaw}
+                onChange={(e) => setAttendeesRaw(e.target.value)}
+              />
+            </div>
+
+            {/* WHERE — stacked so FaceTime / WhatsApp presets stay visible */}
+            <div className="space-y-2.5">
+              <SectionLabel>{t("calendar:create.section.where")}</SectionLabel>
+              <div>
+                <FieldLabel icon={ICON.location}>{t("calendar:create.location")}</FieldLabel>
+                <input
+                  className={inputCls}
+                  value={location}
+                  onChange={(e) => setLocation(e.target.value)}
+                />
+              </div>
+              <div>
+                <FieldLabel icon={ICON.link}>{t("calendar:create.joinUrl")}</FieldLabel>
+                <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
                   <button
                     type="button"
-                    disabled={teamsPending}
-                    onClick={() => void createTeamsMeeting()}
-                    title={t("calendar:create.teamsTip")}
-                    className="inline-flex items-center gap-1 rounded-full border border-accent/30 bg-accent/[0.06] px-2.5 py-1 text-[11.5px] font-medium text-accent transition hover:bg-accent/10 disabled:opacity-50"
+                    onClick={() => fillCallLink("facetime")}
+                    title={t("calendar:create.facetimeTip")}
+                    className="inline-flex items-center gap-1 rounded-full border border-hairline bg-bg2/60 px-2.5 py-1 text-[11.5px] font-medium text-ink-muted transition hover:border-accent/30 hover:bg-accent/[0.06] hover:text-accent"
                   >
-                    {teamsPending ? (
-                      <span className="co-spinner size-2.5 rounded-full border-[1.5px] border-hairline-strong border-t-accent" />
-                    ) : (
-                      ICON.video
-                    )}
-                    {t("calendar:create.teamsMeeting")}
+                    {t("calendar:create.facetime")}
                   </button>
-                )}
+                  <button
+                    type="button"
+                    onClick={() => fillCallLink("whatsapp")}
+                    title={t("calendar:create.whatsappTip")}
+                    className="inline-flex items-center gap-1 rounded-full border border-hairline bg-bg2/60 px-2.5 py-1 text-[11.5px] font-medium text-ink-muted transition hover:border-accent/30 hover:bg-accent/[0.06] hover:text-accent"
+                  >
+                    {t("calendar:create.whatsapp")}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => fillCallLink("both")}
+                    title={t("calendar:create.bothCallsTip")}
+                    className="inline-flex items-center gap-1 rounded-full border border-hairline bg-bg2/60 px-2.5 py-1 text-[11.5px] font-medium text-ink-muted transition hover:border-accent/30 hover:bg-accent/[0.06] hover:text-accent"
+                  >
+                    {t("calendar:create.bothCalls")}
+                  </button>
+                  {isMicrosoftAccount && (
+                    <button
+                      type="button"
+                      disabled={teamsPending}
+                      onClick={() => void createTeamsMeeting()}
+                      title={t("calendar:create.teamsTip")}
+                      className="inline-flex items-center gap-1 rounded-full border border-accent/30 bg-accent/[0.06] px-2.5 py-1 text-[11.5px] font-medium text-accent transition hover:bg-accent/10 disabled:opacity-50"
+                    >
+                      {teamsPending ? (
+                        <span className="co-spinner size-2.5 rounded-full border-[1.5px] border-hairline-strong border-t-accent" />
+                      ) : (
+                        ICON.video
+                      )}
+                      {t("calendar:create.teamsMeeting")}
+                    </button>
+                  )}
+                </div>
+                <input
+                  className={inputCls}
+                  placeholder="https://meet…"
+                  value={joinUrl}
+                  onChange={(e) => setJoinUrl(e.target.value)}
+                />
               </div>
-              <input
-                className={inputCls}
-                placeholder="https://meet…"
-                value={joinUrl}
-                onChange={(e) => setJoinUrl(e.target.value)}
+            </div>
+
+            {/* NOTES */}
+            <div>
+              <SectionLabel>{t("calendar:create.section.notes")}</SectionLabel>
+              <FieldLabel icon={ICON.notes}>{t("calendar:create.description")}</FieldLabel>
+              <textarea
+                className={`${inputCls} min-h-16 resize-y`}
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
               />
             </div>
           </div>
-
-          {/* NOTES */}
-          <div>
-            <SectionLabel>{t("calendar:create.section.notes")}</SectionLabel>
-            <FieldLabel icon={ICON.notes}>{t("calendar:create.description")}</FieldLabel>
-            <textarea
-              className={`${inputCls} min-h-16 resize-y`}
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-            />
-          </div>
         </div>
 
-        <div className="-mx-4 mt-4 border-b border-hairline" />
-        <footer className="mt-3 flex items-center justify-end gap-2">
+        <div className="mx-4 shrink-0 border-b border-hairline" />
+        <footer className="flex shrink-0 items-center justify-end gap-2 px-4 pt-3 pb-4">
           <button
             type="button"
             className="rounded-md px-3 py-1.5 text-[12.5px] text-ink-muted hover:bg-bg2 hover:text-ink"
